@@ -282,10 +282,12 @@ class CausalBertWrapper:
         out = defaultdict(list)
         for i, (W, C, T, Y) in enumerate(zip(texts, confounds, treatments, outcomes)):
             # out['W_raw'].append(W)
-            encoded_sent = tokenizer.encode_plus(W, add_special_tokens=True,
+            encoded_sent = tokenizer.encode_plus(
+                W, 
+                add_special_tokens=True,
+                padding='max_length',
                 max_length=self.max_length,
-                truncation=True,
-                pad_to_max_length=True)
+                truncation=True)
 
             out['W_ids'].append(encoded_sent['input_ids'])
             out['W_mask'].append(encoded_sent['attention_mask'])
