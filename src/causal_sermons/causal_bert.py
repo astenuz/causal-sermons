@@ -13,7 +13,7 @@ from sklearn.model_selection import KFold
 from torch.utils.data import Dataset, TensorDataset, DataLoader, RandomSampler, SequentialSampler
 
 from transformers import BertTokenizer
-from transformers import BertModel, BertPreTrainedModel, AdamW, BertConfig
+from transformers import BertModel, BertPreTrainedModel, BertConfig
 from transformers import get_linear_schedule_with_warmup
 
 from transformers import DistilBertTokenizer
@@ -23,6 +23,7 @@ from torch.nn import CrossEntropyLoss
 
 import torch
 import torch.nn as nn
+from torch.optim import AdamW
 from scipy.special import softmax
 import numpy as np
 from scipy.special import logit
@@ -174,7 +175,7 @@ class CausalBertWrapper:
     """Model wrapper in charge of training and inference."""
 
     def __init__(self, g_weight=1.0, Q_weight=0.1, mlm_weight=1.0,
-        batch_size=32):
+        batch_size=32, max_length=128):
         self.model = CausalBert.from_pretrained(
             "distilbert-base-uncased",
             num_labels=2,
@@ -189,6 +190,7 @@ class CausalBertWrapper:
             'mlm': mlm_weight
         }
         self.batch_size = batch_size
+        self.max_length = max_length
 
 
     def train(self, texts, confounds, treatments, outcomes,
@@ -227,8 +229,11 @@ class CausalBertWrapper:
 
     def inference(self, texts, confounds, outcome=None):
         self.model.eval()
-        dataloader = self.build_dataloader(texts, confounds, outcomes=outcome,
+
+        dataloader = self.build_dataloader(
+            texts, confounds, outcomes=outcome,
             sampler='sequential')
+        
         Q0s = []
         Q1s = []
         Ys = []
@@ -277,10 +282,12 @@ class CausalBertWrapper:
         out = defaultdict(list)
         for i, (W, C, T, Y) in enumerate(zip(texts, confounds, treatments, outcomes)):
             # out['W_raw'].append(W)
-            encoded_sent = tokenizer.encode_plus(W, add_special_tokens=True,
-                max_length=128,
-                truncation=True,
-                pad_to_max_length=True)
+            encoded_sent = tokenizer.encode_plus(
+                W, 
+                add_special_tokens=True,
+                padding='max_length',
+                max_length=self.max_length,
+                truncation=True)
 
             out['W_ids'].append(encoded_sent['input_ids'])
             out['W_mask'].append(encoded_sent['attention_mask'])
