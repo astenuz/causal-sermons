@@ -23,6 +23,7 @@ from torch.nn import CrossEntropyLoss
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from scipy.special import softmax
 import numpy as np
@@ -72,32 +73,47 @@ def make_bow_vector(ids, vocab_size, use_counts=False):
     return vec
 
 
+class DragonHeads(nn.Module):
+    def __init__(self, 
+                 num_outs, hidden_size, num_confounders):
+        """
+        Dragon heads for Q(0), Q(1) and g
+
+        - Can predict multiple potential outcomes at the same time via num_outs
+        - Only one binary treatment, still 
+        - Also accomodates for numeric confounders
+        """
+        super().__init__()
+        
+        self.Q_cls = nn.ModuleDict()
+    
+        for T in range(2):
+            # ModuleDict keys have to be strings.
+            self.Q_cls['%d' % T] = nn.Sequential(
+                nn.Linear(hidden_size + num_confounders, 200),
+                nn.ReLU(),
+                nn.Linear(200, num_outs))
+
+        self.g_cls = nn.Linear(hidden_size + num_confounders, 1)
+
 
 class CausalBert(DistilBertPreTrainedModel):
     """The model itself."""
-    def __init__(self, config):
+    def __init__(self, config, num_outs=1, num_confounders=2):
         super().__init__(config)
 
         self.num_labels = config.num_labels
         self.vocab_size = config.vocab_size
+        self.num_outs = num_outs
+        self.num_confounders = num_confounders
 
-        self.distilbert = DistilBertModel(config)
+        self.bert = DistilBertModel(config)
         # self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.vocab_transform = nn.Linear(config.dim, config.dim)
         self.vocab_layer_norm = nn.LayerNorm(config.dim, eps=1e-12)
         self.vocab_projector = nn.Linear(config.dim, config.vocab_size)
 
-        self.Q_cls = nn.ModuleDict()
-
-        for T in range(2):
-            # ModuleDict keys have to be strings..
-            self.Q_cls['%d' % T] = nn.Sequential(
-                nn.Linear(config.hidden_size + self.num_labels, 200),
-                nn.ReLU(),
-                nn.Linear(200, self.num_labels))
-
-        self.g_cls = nn.Linear(config.hidden_size + self.num_labels, 
-            self.config.num_labels)
+        self.dragonheads = DragonHeads(self.num_outs, self.config.hidden_size, self.num_confounders)
 
         self.init_weights()
 
@@ -113,7 +129,7 @@ class CausalBert(DistilBertPreTrainedModel):
             mlm_labels.scatter_(1, mask, target_words)
             W_ids.scatter_(1, mask, MASK_IDX)
 
-        outputs = self.distilbert(W_ids, attention_mask=W_mask)
+        outputs = self.bert(W_ids, attention_mask=W_mask)
         seq_output = outputs[0]
         pooled_output = seq_output[:, 0]
         # seq_output, pooled_output = outputs[:2]
@@ -129,13 +145,19 @@ class CausalBert(DistilBertPreTrainedModel):
         else:
             mlm_loss = 0.0
 
-        C_bow = make_bow_vector(C.unsqueeze(1), self.num_labels)
-        inputs = torch.cat((pooled_output, C_bow), 1)
+        # constructing input of language model + confounders
+        # previous version that used a categorical C
+        # C_bow = make_bow_vector(C.unsqueeze(1), self.num_labels)
+        C = C.to(pooled_output.dtype)
+        T = T.to(pooled_output.dtype)
+
+        inputs = torch.cat((pooled_output, C), 1)
 
         # g logits
-        g = self.g_cls(inputs)
+        g = self.dragonheads.g_cls(inputs)
         if Y is not None:  # TODO train/test mode, this is a lil hacky
-            g_loss = CrossEntropyLoss()(g.view(-1, self.num_labels), T.view(-1))
+            # g_loss = CrossEntropyLoss()(g.view(-1, self.num_labels), T.view(-1))
+            g_loss = F.binary_cross_entropy_with_logits(g.view(-1), T.view(-1))
         else:
             g_loss = 0.0
 
@@ -143,44 +165,52 @@ class CausalBert(DistilBertPreTrainedModel):
         # run each example through its corresponding T matrix
         # TODO this would be cleaner with sigmoid and BCELoss, but less general 
         #   (and I couldn't get it to work as well)
-        Q_logits_T0 = self.Q_cls['0'](inputs)
-        Q_logits_T1 = self.Q_cls['1'](inputs)
+        Q_logits_T0 = self.dragonheads.Q_cls['0'](inputs)
+        Q_logits_T1 = self.dragonheads.Q_cls['1'](inputs)
 
         if Y is not None:
+            # T0_indices = (T == 0).nonzero().squeeze()
+            # Replacing by -100 ignores the particular instance
+            # Y_T1_labels = Y.clone().scatter(0, T0_indices, -100)
+
+            # Replacing by -100 ignores the particular instance
+            # T1_indices = (T == 1).nonzero().squeeze()
+            # Y_T0_labels = Y.clone().scatter(0, T1_indices, -100)
+
+            # Q_loss_T1 = CrossEntropyLoss()(
+            #     Q_logits_T1.view(-1, self.num_labels), Y_T1_labels)
+            # Q_loss_T0 = CrossEntropyLoss()(
+            #     Q_logits_T0.view(-1, self.num_labels), Y_T0_labels)
+
             T0_indices = (T == 0).nonzero().squeeze()
-            Y_T1_labels = Y.clone().scatter(0, T0_indices, -100)
-
             T1_indices = (T == 1).nonzero().squeeze()
-            Y_T0_labels = Y.clone().scatter(0, T1_indices, -100)
 
-            Q_loss_T1 = CrossEntropyLoss()(
-                Q_logits_T1.view(-1, self.num_labels), Y_T1_labels)
-            Q_loss_T0 = CrossEntropyLoss()(
-                Q_logits_T0.view(-1, self.num_labels), Y_T0_labels)
-
+            Q_loss_T0 = F.binary_cross_entropy_with_logits(Q_logits_T0, Y.clone(), weight=T0_indices)
+            Q_loss_T1 = F.binary_cross_entropy_with_logits(Q_logits_T1, Y.clone(), weight=T1_indices)
+            
             Q_loss = Q_loss_T0 + Q_loss_T1
         else:
             Q_loss = 0.0
 
-        sm = nn.Softmax(dim=1)
-        Q0 = sm(Q_logits_T0)[:, 1]
-        Q1 = sm(Q_logits_T1)[:, 1]
-        g = sm(g)[:, 1]
+        # TODO add sigmoid if binary outcomes
+        Q0 = Q_logits_T0
+        Q1 = Q_logits_T1
+        g = F.sigmoid(g)
 
         return g, Q0, Q1, g_loss, Q_loss, mlm_loss
 
 
 
-class CausalBertWrapper:
+class CausalModelWrapper:
     """Model wrapper in charge of training and inference."""
 
-    def __init__(self, g_weight=1.0, Q_weight=0.1, mlm_weight=1.0,
-        batch_size=32, max_length=128):
-        self.model = CausalBert.from_pretrained(
-            "distilbert-base-uncased",
-            num_labels=2,
-            output_attentions=False,
-            output_hidden_states=False)
+    def __init__(self, 
+                 model,
+                 g_weight=1.0, Q_weight=0.1, mlm_weight=1.0,
+                 batch_size=32, max_length=128):
+        
+        self.model = model
+        
         if CUDA:
             self.model = self.model.cuda()
 
@@ -278,6 +308,8 @@ class CausalBertWrapper:
         if tokenizer is None:
             tokenizer = DistilBertTokenizer.from_pretrained(
                 'distilbert-base-uncased', do_lower_case=True)
+            
+        confounds = confounds.values
 
         out = defaultdict(list)
         for i, (W, C, T, Y) in enumerate(zip(texts, confounds, treatments, outcomes)):
@@ -295,9 +327,10 @@ class CausalBertWrapper:
             out['Y'].append(Y)
             out['T'].append(T)
             out['C'].append(C)
-            # if i > 100: break
+            if i > 10: break
 
         data = (torch.tensor(out[x]) for x in ['W_ids', 'W_len', 'W_mask', 'C', 'T', 'Y'])
+
         data = TensorDataset(*data)
         sampler = RandomSampler(data) if sampler == 'random' else SequentialSampler(data)
         dataloader = DataLoader(data, sampler=sampler, batch_size=self.batch_size)
@@ -310,16 +343,16 @@ if __name__ == '__main__':
     import pandas as pd
 
     df = pd.read_csv('testdata.csv')
-    cb = CausalBertWrapper(batch_size=2,
+
+    # original form
+    model = CausalBert.from_pretrained(
+            "distilbert-base-uncased",
+            num_labels=2,
+            output_attentions=False,
+            output_hidden_states=False)
+
+    cb = CausalModelWrapper(model, batch_size=2,
         g_weight=0.1, Q_weight=0.1, mlm_weight=1)
     print(df.T)
     cb.train(df['text'], df['C'], df['T'], df['Y'], epochs=1)
     print(cb.ATE(df['C'], df.text, platt_scaling=True))
-
-
-
-
-
-
-
-
