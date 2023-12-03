@@ -79,11 +79,15 @@ class DragonHeads(nn.Module):
         """
         Dragon heads for Q(0), Q(1) and g
 
-        - Can predict multiple potential outcomes at the same time via num_outs
+        - Can predict multiple potential outcomes at the same time via num_outcomes
         - Only one binary treatment, still 
         - Also accomodates for numeric confounders
         """
         super().__init__()
+
+        self.num_outcomes = num_outcomes
+        self.hidden_size = hidden_size
+        self.num_confounders = num_confounders
         
         self.Q_cls = nn.ModuleDict()
     
@@ -96,6 +100,37 @@ class DragonHeads(nn.Module):
 
         self.g_cls = nn.Linear(hidden_size + num_confounders, 1)
 
+    def forward(self, inputs, T, Y):
+        # g logits
+        g = self.g_cls(inputs)
+
+        # conditional expected outcome logits: 
+        # run each example through its corresponding T matrix
+        Q_logits_T0 = self.Q_cls['0'](inputs)
+        Q_logits_T1 = self.Q_cls['1'](inputs)
+
+        # TODO add sigmoid if binary outcomes
+        Q0 = Q_logits_T0
+        Q1 = Q_logits_T1
+
+        if self.training:
+            # g loss
+            g_loss = F.binary_cross_entropy_with_logits(g.view(-1), T.view(-1))
+
+            # Q loss
+            T0_ws = (T == 0.0).float().unsqueeze(1).repeat(1, self.num_outcomes)
+            T1_ws = (T == 1.0).float().unsqueeze(1).repeat(1, self.num_outcomes)
+
+            Q_loss_T0 = T0_ws * F.mse_loss(Q0, Y, reduction='none')
+            Q_loss_T1 = T1_ws * F.mse_loss(Q1, Y, reduction='none')
+            
+            Q_loss = Q_loss_T0.mean() + Q_loss_T1.mean()
+        else:
+            g_loss = 0.0
+            Q_loss = 0.0
+
+        return g, Q0, Q1, g_loss, Q_loss
+
 
 class CausalBert(DistilBertPreTrainedModel):
     """The model itself."""
@@ -104,7 +139,7 @@ class CausalBert(DistilBertPreTrainedModel):
 
         self.num_labels = config.num_labels
         self.vocab_size = config.vocab_size
-        self.num_outs = num_outcomes
+        self.num_outcomes = num_outcomes
         self.num_confounders = num_confounders
 
         self.bert = DistilBertModel(config)
@@ -113,7 +148,7 @@ class CausalBert(DistilBertPreTrainedModel):
         self.vocab_layer_norm = nn.LayerNorm(config.dim, eps=1e-12)
         self.vocab_projector = nn.Linear(config.dim, config.vocab_size)
 
-        self.dragonheads = DragonHeads(self.num_outs, self.config.hidden_size, self.num_confounders)
+        self.dragonheads = DragonHeads(self.num_outcomes, self.config.hidden_size, self.num_confounders)
 
         self.init_weights()
 
@@ -140,6 +175,7 @@ class CausalBert(DistilBertPreTrainedModel):
             prediction_logits = gelu(prediction_logits)  # (bs, seq_length, dim)
             prediction_logits = self.vocab_layer_norm(prediction_logits)  # (bs, seq_length, dim)
             prediction_logits = self.vocab_projector(prediction_logits)  # (bs, seq_length, vocab_size)
+
             mlm_loss = CrossEntropyLoss()(
                 prediction_logits.view(-1, self.vocab_size), mlm_labels.view(-1))
         else:
@@ -147,7 +183,6 @@ class CausalBert(DistilBertPreTrainedModel):
 
         # constructing input of language model + confounders
         # previous version that used a categorical C
-        # C_bow = make_bow_vector(C.unsqueeze(1), self.num_labels)
         C = C.to(pooled_output.dtype)
         T = T.to(pooled_output.dtype)
 
@@ -156,37 +191,9 @@ class CausalBert(DistilBertPreTrainedModel):
 
         inputs = torch.cat((pooled_output, C), 1)
 
-        # g logits
-        g = self.dragonheads.g_cls(inputs)
+        g, Q0, Q1, g_loss, Q_loss = self.dragonheads(inputs, T, Y)
 
-        if self.training:
-            # g_loss = CrossEntropyLoss()(g.view(-1, self.num_labels), T.view(-1))
-            g_loss = F.binary_cross_entropy_with_logits(g.view(-1), T.view(-1))
-        else:
-            g_loss = 0.0
-
-        # conditional expected outcome logits: 
-        # run each example through its corresponding T matrix
-        Q_logits_T0 = self.dragonheads.Q_cls['0'](inputs)
-        Q_logits_T1 = self.dragonheads.Q_cls['1'](inputs)
-
-        if self.training:
-            T0_ws = (T == 0.0).float().unsqueeze(1).repeat(1, self.num_outs)
-            T1_ws = (T == 1.0).float().unsqueeze(1).repeat(1, self.num_outs)
-
-            Q_loss_T0 = T0_ws * F.mse_loss(Q_logits_T0, Y, reduction='none')
-            Q_loss_T1 = T1_ws * F.mse_loss(Q_logits_T1, Y, reduction='none')
-            
-            Q_loss = Q_loss_T0.mean() + Q_loss_T1.mean()
-        else:
-            Q_loss = 0.0
-
-        # TODO add sigmoid if binary outcomes
-        Q0 = Q_logits_T0
-        Q1 = Q_logits_T1
-        g = F.sigmoid(g)
-
-        return g, Q0, Q1, g_loss, Q_loss, mlm_loss
+        return F.sigmoid(g), Q0, Q1, g_loss, Q_loss, mlm_loss
 
 
 class CausalModelWrapper:
@@ -210,40 +217,60 @@ class CausalModelWrapper:
         self.batch_size = batch_size
         self.max_length = max_length
 
+    def train_step(self, step, batch):
+        if CUDA: 
+            batch = (x.cuda() for x in batch)
+
+        W_ids, W_len, W_mask, C, T, Y = batch
+        self.model.zero_grad()
+
+        g, Q0, Q1, g_loss, Q_loss, mlm_loss = self.model(W_ids, W_len, W_mask, C, T, Y)
+        
+        loss = self.loss_weights['g'] * g_loss + \
+                self.loss_weights['Q'] * Q_loss + \
+                self.loss_weights['mlm'] * mlm_loss
+        
+        loss.backward()
+        self.optimizer.step()
+        self.scheduler.step()
+
+        return loss
 
     def train(self, texts, confounds, treatments, outcomes,
             learning_rate=2e-5, epochs=3):
+        
         dataloader = self.build_dataloader(
             texts, confounds, treatments, outcomes)
 
         self.model.train()
-        optimizer = AdamW(self.model.parameters(), lr=learning_rate, eps=1e-8)
+
+        self.optimizer = AdamW(self.model.parameters(), lr=learning_rate, eps=1e-8)
+        
         total_steps = len(dataloader) * epochs
         warmup_steps = total_steps * 0.1
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
 
         for epoch in range(epochs):
             losses = []
             self.model.train()
             for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
-                    if CUDA: 
-                        batch = (x.cuda() for x in batch)
-                    W_ids, W_len, W_mask, C, T, Y = batch
-                    # while True:
-                    self.model.zero_grad()
-                    g, Q0, Q1, g_loss, Q_loss, mlm_loss = self.model(W_ids, W_len, W_mask, C, T, Y)
-                    loss = self.loss_weights['g'] * g_loss + \
-                            self.loss_weights['Q'] * Q_loss + \
-                            self.loss_weights['mlm'] * mlm_loss
-                    loss.backward()
-                    optimizer.step()
-                    scheduler.step()
+                    loss = self.train_step(step, batch)
                     losses.append(loss.detach().cpu().item())
                 # print(np.mean(losses))
                     # if step > 5: continue
-        return self.model
 
+        return self
+    
+    def inference_step(self, step, batch):
+        if CUDA: 
+            batch = (x.cuda() for x in batch)
+        W_ids, W_len, W_mask, C, T, Y = batch
+
+        # not passing Y
+        g, Q0, Q1, _, _, _ = self.model(W_ids, W_len, W_mask, C, T, use_mlm=False)
+
+        return g, Q0, Q1, Y
 
     def inference(self, texts, confounds, outcomes=None):
         self.model.eval()
@@ -256,23 +283,15 @@ class CausalModelWrapper:
         Q0s = []
         Q1s = []
         Ys = []
-        for i, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
-            if CUDA: 
-                batch = (x.cuda() for x in batch)
-            W_ids, W_len, W_mask, C, T, Y = batch
-
-            # not passing Y
-            g, Q0, Q1, _, _, _ = self.model(W_ids, W_len, W_mask, C, T, use_mlm=False)
+        for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
+            g, Q0, Q1, Y = self.inference_step(step, batch)
 
             gs.append(g.detach().cpu())
             Q0s.append(Q0.detach().cpu())
             Q1s.append(Q1.detach().cpu())
             Ys.append(Y.detach().cpu())
 
-            # Q0s += Q0.detach().cpu().numpy().tolist()
-            # Q1s += Q1.detach().cpu().numpy().tolist()
-            # Ys += Y.detach().cpu().numpy().tolist()
-            # if i > 5: break
+            # if step > 5: break
 
         # probs = np.array(list(zip(Q0s, Q1s)))
         # preds = np.argmax(probs, axis=1)  # this did not make much sense
