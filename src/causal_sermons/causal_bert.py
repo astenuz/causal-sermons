@@ -75,7 +75,7 @@ def make_bow_vector(ids, vocab_size, use_counts=False):
 
 class DragonHeads(nn.Module):
     def __init__(self, 
-                 num_outs, hidden_size, num_confounders):
+                 num_outcomes, hidden_size, num_confounders):
         """
         Dragon heads for Q(0), Q(1) and g
 
@@ -92,19 +92,19 @@ class DragonHeads(nn.Module):
             self.Q_cls['%d' % T] = nn.Sequential(
                 nn.Linear(hidden_size + num_confounders, 200),
                 nn.ReLU(),
-                nn.Linear(200, num_outs))
+                nn.Linear(200, num_outcomes))
 
         self.g_cls = nn.Linear(hidden_size + num_confounders, 1)
 
 
 class CausalBert(DistilBertPreTrainedModel):
     """The model itself."""
-    def __init__(self, config, num_outs=1, num_confounders=2):
+    def __init__(self, config, num_outcomes=1, num_confounders=2):
         super().__init__(config)
 
         self.num_labels = config.num_labels
         self.vocab_size = config.vocab_size
-        self.num_outs = num_outs
+        self.num_outs = num_outcomes
         self.num_confounders = num_confounders
 
         self.bert = DistilBertModel(config)
@@ -135,7 +135,7 @@ class CausalBert(DistilBertPreTrainedModel):
         # seq_output, pooled_output = outputs[:2]
         # pooled_output = self.dropout(pooled_output)
 
-        if use_mlm:
+        if use_mlm and self.training:
             prediction_logits = self.vocab_transform(seq_output)  # (bs, seq_length, dim)
             prediction_logits = gelu(prediction_logits)  # (bs, seq_length, dim)
             prediction_logits = self.vocab_layer_norm(prediction_logits)  # (bs, seq_length, dim)
@@ -151,11 +151,15 @@ class CausalBert(DistilBertPreTrainedModel):
         C = C.to(pooled_output.dtype)
         T = T.to(pooled_output.dtype)
 
+        if Y is not None:
+            Y = Y.to(pooled_output.dtype)
+
         inputs = torch.cat((pooled_output, C), 1)
 
         # g logits
         g = self.dragonheads.g_cls(inputs)
-        if Y is not None:  # TODO train/test mode, this is a lil hacky
+
+        if self.training:
             # g_loss = CrossEntropyLoss()(g.view(-1, self.num_labels), T.view(-1))
             g_loss = F.binary_cross_entropy_with_logits(g.view(-1), T.view(-1))
         else:
@@ -163,32 +167,17 @@ class CausalBert(DistilBertPreTrainedModel):
 
         # conditional expected outcome logits: 
         # run each example through its corresponding T matrix
-        # TODO this would be cleaner with sigmoid and BCELoss, but less general 
-        #   (and I couldn't get it to work as well)
         Q_logits_T0 = self.dragonheads.Q_cls['0'](inputs)
         Q_logits_T1 = self.dragonheads.Q_cls['1'](inputs)
 
-        if Y is not None:
-            # T0_indices = (T == 0).nonzero().squeeze()
-            # Replacing by -100 ignores the particular instance
-            # Y_T1_labels = Y.clone().scatter(0, T0_indices, -100)
+        if self.training:
+            T0_ws = (T == 0.0).float().unsqueeze(1).repeat(1, self.num_outs)
+            T1_ws = (T == 1.0).float().unsqueeze(1).repeat(1, self.num_outs)
 
-            # Replacing by -100 ignores the particular instance
-            # T1_indices = (T == 1).nonzero().squeeze()
-            # Y_T0_labels = Y.clone().scatter(0, T1_indices, -100)
-
-            # Q_loss_T1 = CrossEntropyLoss()(
-            #     Q_logits_T1.view(-1, self.num_labels), Y_T1_labels)
-            # Q_loss_T0 = CrossEntropyLoss()(
-            #     Q_logits_T0.view(-1, self.num_labels), Y_T0_labels)
-
-            T0_indices = (T == 0).nonzero().squeeze()
-            T1_indices = (T == 1).nonzero().squeeze()
-
-            Q_loss_T0 = F.binary_cross_entropy_with_logits(Q_logits_T0, Y.clone(), weight=T0_indices)
-            Q_loss_T1 = F.binary_cross_entropy_with_logits(Q_logits_T1, Y.clone(), weight=T1_indices)
+            Q_loss_T0 = T0_ws * F.mse_loss(Q_logits_T0, Y, reduction='none')
+            Q_loss_T1 = T1_ws * F.mse_loss(Q_logits_T1, Y, reduction='none')
             
-            Q_loss = Q_loss_T0 + Q_loss_T1
+            Q_loss = Q_loss_T0.mean() + Q_loss_T1.mean()
         else:
             Q_loss = 0.0
 
@@ -198,7 +187,6 @@ class CausalBert(DistilBertPreTrainedModel):
         g = F.sigmoid(g)
 
         return g, Q0, Q1, g_loss, Q_loss, mlm_loss
-
 
 
 class CausalModelWrapper:
@@ -257,13 +245,14 @@ class CausalModelWrapper:
         return self.model
 
 
-    def inference(self, texts, confounds, outcome=None):
+    def inference(self, texts, confounds, outcomes=None):
         self.model.eval()
 
         dataloader = self.build_dataloader(
-            texts, confounds, outcomes=outcome,
+            texts, confounds, outcomes=outcomes,
             sampler='sequential')
         
+        gs = []
         Q0s = []
         Q1s = []
         Ys = []
@@ -271,17 +260,36 @@ class CausalModelWrapper:
             if CUDA: 
                 batch = (x.cuda() for x in batch)
             W_ids, W_len, W_mask, C, T, Y = batch
+
+            # not passing Y
             g, Q0, Q1, _, _, _ = self.model(W_ids, W_len, W_mask, C, T, use_mlm=False)
-            Q0s += Q0.detach().cpu().numpy().tolist()
-            Q1s += Q1.detach().cpu().numpy().tolist()
-            Ys += Y.detach().cpu().numpy().tolist()
+
+            gs.append(g.detach().cpu())
+            Q0s.append(Q0.detach().cpu())
+            Q1s.append(Q1.detach().cpu())
+            Ys.append(Y.detach().cpu())
+
+            # Q0s += Q0.detach().cpu().numpy().tolist()
+            # Q1s += Q1.detach().cpu().numpy().tolist()
+            # Ys += Y.detach().cpu().numpy().tolist()
             # if i > 5: break
-        probs = np.array(list(zip(Q0s, Q1s)))
-        preds = np.argmax(probs, axis=1)
 
-        return probs, preds, Ys
+        # probs = np.array(list(zip(Q0s, Q1s)))
+        # preds = np.argmax(probs, axis=1)  # this did not make much sense
 
-    def ATE(self, C, W, Y=None, platt_scaling=False):
+        return (
+            torch.cat(gs, dim=0), 
+            torch.cat(Q0s, dim=0), 
+            torch.cat(Q1s, dim=0), 
+            torch.cat(Ys, dim=0))
+
+    def ATE(self, texts, confounds, outcomes=None, platt_scaling=False):
+        g, Q0, Q1, Y = self.inference(
+            texts=texts, confounds=confounds, outcomes=outcomes)
+
+        return (Q1 - Q0).mean(dim=0).numpy()
+    
+    def ATE_old(self, C, W, Y=None, platt_scaling=False):
         Q_probs, _, Ys = self.inference(W, C, outcome=Y)
         if platt_scaling and Y is not None:
             Q0 = platt_scale(Ys, Q_probs[:, 0])[:, 0]
@@ -299,18 +307,21 @@ class CausalModelWrapper:
             # (do this here on cpu for speed)
             data.sort(key=lambda x: (x[1], x[2]))
             return data
+        
+        confounds = confounds.values
+        if outcomes is not None:
+            outcomes = outcomes.values
+
         # fill with dummy values
         if treatments is None:
-            treatments = [-1 for _ in range(len(confounds))]
+            treatments = np.full((len(confounds), 2), -1)  # like this to fit expected format
         if outcomes is None:
-            outcomes = [-1 for _ in range(len(treatments))]
+            outcomes = np.full(len(treatments), -1)
 
         if tokenizer is None:
             tokenizer = DistilBertTokenizer.from_pretrained(
                 'distilbert-base-uncased', do_lower_case=True)
             
-        confounds = confounds.values
-
         out = defaultdict(list)
         for i, (W, C, T, Y) in enumerate(zip(texts, confounds, treatments, outcomes)):
             # out['W_raw'].append(W)
@@ -327,7 +338,6 @@ class CausalModelWrapper:
             out['Y'].append(Y)
             out['T'].append(T)
             out['C'].append(C)
-            if i > 10: break
 
         data = (torch.tensor(out[x]) for x in ['W_ids', 'W_len', 'W_mask', 'C', 'T', 'Y'])
 
