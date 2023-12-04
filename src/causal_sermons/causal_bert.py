@@ -33,6 +33,8 @@ from sklearn.linear_model import LogisticRegression
 from tqdm import tqdm
 import math
 
+from src.causal_sermons.ate import all_ate_estimators
+
 CUDA = (torch.cuda.device_count() > 0)
 MASK_IDX = 103
 
@@ -270,25 +272,30 @@ class CausalModelWrapper:
         # not passing Y
         g, Q0, Q1, _, _, _ = self.model(W_ids, W_len, W_mask, C, T, use_mlm=False)
 
-        return g, Q0, Q1, Y
+        return g, Q0, Q1, T, Y
 
-    def inference(self, texts, confounds, outcomes=None):
+    def inference(self, texts, confounds, treatments=None, outcomes=None):
         self.model.eval()
 
         dataloader = self.build_dataloader(
-            texts, confounds, outcomes=outcomes,
+            texts, confounds, treatments, outcomes,
             sampler='sequential')
         
         gs = []
         Q0s = []
         Q1s = []
+        Ts = []
         Ys = []
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
-            g, Q0, Q1, Y = self.inference_step(step, batch)
+            g, Q0, Q1, T, Y = self.inference_step(step, batch)
+
+            # so that T matches pattern of others
+            T = T.unsqueeze(1)
 
             gs.append(g.detach().cpu())
             Q0s.append(Q0.detach().cpu())
             Q1s.append(Q1.detach().cpu())
+            Ts.append(T.detach().cpu())
             Ys.append(Y.detach().cpu())
 
             # if step > 5: break
@@ -297,16 +304,18 @@ class CausalModelWrapper:
         # preds = np.argmax(probs, axis=1)  # this did not make much sense
 
         return (
-            torch.cat(gs, dim=0), 
-            torch.cat(Q0s, dim=0), 
-            torch.cat(Q1s, dim=0), 
-            torch.cat(Ys, dim=0))
+            torch.cat(gs, dim=0).numpy(), 
+            torch.cat(Q0s, dim=0).numpy(), 
+            torch.cat(Q1s, dim=0).numpy(), 
+            torch.cat(Ts, dim=0).numpy(), 
+            torch.cat(Ys, dim=0).numpy()
+        )
 
-    def ATE(self, texts, confounds, outcomes=None, platt_scaling=False):
-        g, Q0, Q1, Y = self.inference(
-            texts=texts, confounds=confounds, outcomes=outcomes)
+    def ATE(self, texts, confounds, treatments, outcomes=None):
+        g, Q0, Q1, T, Y = self.inference(
+            texts=texts, confounds=confounds, treatments=treatments, outcomes=outcomes)
 
-        return (Q1 - Q0).mean(dim=0).numpy()
+        return all_ate_estimators(Q0, Q1, g, T, Y)
     
     def ATE_old(self, C, W, Y=None, platt_scaling=False):
         Q_probs, _, Ys = self.inference(W, C, outcome=Y)
