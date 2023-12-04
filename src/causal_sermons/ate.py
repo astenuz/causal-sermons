@@ -2,7 +2,7 @@ import numpy as np
 
 
 def tau_naive(t, y):
-    return y[t == 1].mean(axis=0) - y[t == 0].mean(axis=0)
+    return y[t.flatten() == 1].mean(axis=0) - y[t.flatten() == 0].mean(axis=0)
 
 
 def tau_PI(q_t0, q_t1):
@@ -30,3 +30,11 @@ def all_ate_estimators(q_t0, q_t1, g, t, y):
         'tau_IPW': tau_IPW(g, t, y),
         'tau_DR': tau_DR(q_t0, q_t1, g, t, y),
     }
+
+def get_errors(ate_estimators, gt):
+  return {
+      'error_naive': ate_estimators['tau_naive'] - gt,
+      'error_PI': ate_estimators['tau_PI'] - gt,
+      'error_IPW': ate_estimators['tau_IPW'] - gt,
+      'error_DR': ate_estimators['tau_DR'] - gt
+  }
