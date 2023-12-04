@@ -199,33 +199,38 @@ class CausalDistilBert(DistilBertPreTrainedModel):
 
 
 class CausalDataset(Dataset):
-    def __init__(self, texts, confounds, treatments, outcomes, tokenizer):
-        self.texts = texts
+    def __init__(self, 
+                 texts, confounds, treatments, outcomes, tokenizer,
+                 max_length=256):
+        self.texts = np.array(texts)
         self.confounds = np.array(confounds)
-        self.treatments = treatments if treatments is not None else np.full((len(self.confounds), 2), -1)
+        self.treatments = np.array(treatments) if treatments is not None else np.full((len(self.confounds), 2), -1)
         self.outcomes = np.array(outcomes) if outcomes is not None else np.full(len(self.treatments), -1)
         self.tokenizer = tokenizer
+        self.max_length = max_length
 
     def __getitem__(self, idx):
-        W_id, W_mask, W_len, C, T, Y = self.preprocess_data(
+        return self.preprocess_data(
             self.texts[idx], self.confounds[idx], self.treatments[idx], self.outcomes[idx])
-        return W_id, W_mask, W_len, C, T, Y
 
     def __len__(self):
         return len(self.texts)
 
     def preprocess_data(self, W, C, T, Y):
         encoded_sent = self.tokenizer.encode_plus(
-            W, add_special_tokens=True, padding='max_length', max_length=self.max_length,
-            truncation=True, return_tensors='pt')
+            W, 
+            add_special_tokens=True, 
+            padding='max_length', 
+            max_length=self.max_length,
+            truncation=True)
 
-        W_id = encoded_sent['input_ids'].squeeze()
-        W_mask = encoded_sent['attention_mask'].squeeze()
-        W_len = sum(encoded_sent['attention_mask'][0])
+        W_id = torch.tensor(encoded_sent['input_ids'])
+        W_mask = torch.tensor(encoded_sent['attention_mask'])
+        W_len = torch.tensor(sum(encoded_sent['attention_mask']))
         T = torch.tensor(T)
         Y = torch.tensor(Y)
         C = torch.tensor(C)
-        return W_id, W_mask, W_len, C, T, Y
+        return W_id, W_len, W_mask, C, T, Y
 
 
 class CausalModelWrapper:
@@ -359,54 +364,54 @@ class CausalModelWrapper:
 
         return np.mean(Q0 - Q1)
 
-    # def build_dataloader(self, 
-    #                      texts, confounds, treatments=None, outcomes=None,
-    #                      tokenizer=None, sampler='random'):
-    #     def collate_CandT(data):
-    #         # sort by (C, T), so you can get boundaries later
-    #         # (do this here on cpu for speed)
-    #         data.sort(key=lambda x: (x[1], x[2]))
-    #         return data
+    def build_dataloader_old(self, 
+                         texts, confounds, treatments=None, outcomes=None,
+                         tokenizer=None, sampler='random'):
+        def collate_CandT(data):
+            # sort by (C, T), so you can get boundaries later
+            # (do this here on cpu for speed)
+            data.sort(key=lambda x: (x[1], x[2]))
+            return data
         
-    #     confounds = confounds.values
-    #     if outcomes is not None:
-    #         outcomes = outcomes.values
+        confounds = confounds.values
+        if outcomes is not None:
+            outcomes = outcomes.values
 
-    #     # fill with dummy values
-    #     if treatments is None:
-    #         treatments = np.full((len(confounds), 2), -1)  # like this to fit expected format
-    #     if outcomes is None:
-    #         outcomes = np.full(len(treatments), -1)
+        # fill with dummy values
+        if treatments is None:
+            treatments = np.full((len(confounds), 2), -1)  # like this to fit expected format
+        if outcomes is None:
+            outcomes = np.full(len(treatments), -1)
 
-    #     if tokenizer is None:
-    #         tokenizer = DistilBertTokenizer.from_pretrained(
-    #             'distilbert-base-uncased', do_lower_case=True)
+        if tokenizer is None:
+            tokenizer = DistilBertTokenizer.from_pretrained(
+                'distilbert-base-uncased', do_lower_case=True)
             
-    #     out = defaultdict(list)
-    #     for i, (W, C, T, Y) in enumerate(zip(texts, confounds, treatments, outcomes)):
-    #         # out['W_raw'].append(W)
-    #         encoded_sent = tokenizer.encode_plus(
-    #             W, 
-    #             add_special_tokens=True,
-    #             padding='max_length',
-    #             max_length=self.max_length,
-    #             truncation=True)
+        out = defaultdict(list)
+        for i, (W, C, T, Y) in enumerate(zip(texts, confounds, treatments, outcomes)):
+            # out['W_raw'].append(W)
+            encoded_sent = tokenizer.encode_plus(
+                W, 
+                add_special_tokens=True,
+                padding='max_length',
+                max_length=self.max_length,
+                truncation=True)
 
-    #         out['W_ids'].append(encoded_sent['input_ids'])
-    #         out['W_mask'].append(encoded_sent['attention_mask'])
-    #         out['W_len'].append(sum(encoded_sent['attention_mask']))
-    #         out['Y'].append(Y)
-    #         out['T'].append(T)
-    #         out['C'].append(C)
+            out['W_ids'].append(encoded_sent['input_ids'])
+            out['W_mask'].append(encoded_sent['attention_mask'])
+            out['W_len'].append(sum(encoded_sent['attention_mask']))
+            out['Y'].append(Y)
+            out['T'].append(T)
+            out['C'].append(C)
 
-    #     data = (torch.tensor(out[x]) for x in ['W_ids', 'W_len', 'W_mask', 'C', 'T', 'Y'])
+        data = (torch.tensor(out[x]) for x in ['W_ids', 'W_len', 'W_mask', 'C', 'T', 'Y'])
 
-    #     data = TensorDataset(*data)
-    #     sampler = RandomSampler(data) if sampler == 'random' else SequentialSampler(data)
-    #     dataloader = DataLoader(data, sampler=sampler, batch_size=self.batch_size)
-    #         # collate_fn=collate_CandT)
+        data = TensorDataset(*data)
+        sampler = RandomSampler(data) if sampler == 'random' else SequentialSampler(data)
+        dataloader = DataLoader(data, sampler=sampler, batch_size=self.batch_size)
+            # collate_fn=collate_CandT)
 
-    #     return dataloader
+        return dataloader
     
     def build_dataloader(self, 
                          texts, confounds, treatments=None, outcomes=None,
@@ -416,7 +421,7 @@ class CausalModelWrapper:
             tokenizer = DistilBertTokenizer.from_pretrained(
                 'distilbert-base-uncased', do_lower_case=True)
 
-        dataset = CausalDataset(texts, confounds, treatments, outcomes, tokenizer)
+        dataset = CausalDataset(texts, confounds, treatments, outcomes, tokenizer, max_length=self.max_length)
         sampler = RandomSampler(dataset) if sampler == 'random' else SequentialSampler(dataset)
         dataloader = DataLoader(dataset, sampler=sampler, batch_size=self.batch_size, num_workers=self.num_workers)
 
