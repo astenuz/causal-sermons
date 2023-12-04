@@ -132,7 +132,7 @@ class DragonHeads(nn.Module):
         return g, Q0, Q1, g_loss, Q_loss
 
 
-class CausalBert(DistilBertPreTrainedModel):
+class CausalDistilBert(DistilBertPreTrainedModel):
     """The model itself."""
     def __init__(self, config, num_outcomes=1, num_confounders=2):
         super().__init__(config)
@@ -319,8 +319,9 @@ class CausalModelWrapper:
 
         return np.mean(Q0 - Q1)
 
-    def build_dataloader(self, texts, confounds, treatments=None, outcomes=None,
-        tokenizer=None, sampler='random'):
+    def build_dataloader(self, 
+                         texts, confounds, treatments=None, outcomes=None,
+                         tokenizer=None, sampler='random'):
         def collate_CandT(data):
             # sort by (C, T), so you can get boundaries later
             # (do this here on cpu for speed)
@@ -374,7 +375,7 @@ if __name__ == '__main__':
     df = pd.read_csv('testdata.csv')
 
     # original form
-    model = CausalBert.from_pretrained(
+    model = CausalDistilBert.from_pretrained(
             "distilbert-base-uncased",
             num_labels=2,
             output_attentions=False,
