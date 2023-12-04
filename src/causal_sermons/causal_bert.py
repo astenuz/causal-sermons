@@ -10,14 +10,13 @@ import pickle
 import scipy
 from sklearn.model_selection import KFold
 
-from torch.utils.data import Dataset, TensorDataset, DataLoader, RandomSampler, SequentialSampler
+from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
 
-from transformers import BertTokenizer
-from transformers import BertModel, BertPreTrainedModel, BertConfig
 from transformers import get_linear_schedule_with_warmup
 
-from transformers import DistilBertTokenizer
-from transformers import DistilBertModel, DistilBertPreTrainedModel
+from transformers import BertModel, BertPreTrainedModel, BertTokenizer
+from transformers import DistilBertModel, DistilBertPreTrainedModel, DistilBertTokenizer
+from transformers import LongformerModel, LongformerPreTrainedModel, LongformerTokenizer
 
 from torch.nn import CrossEntropyLoss
 
@@ -198,6 +197,70 @@ class CausalDistilBert(DistilBertPreTrainedModel):
         return F.sigmoid(g), Q0, Q1, g_loss, Q_loss, mlm_loss
 
 
+class CausalLongformer(LongformerPreTrainedModel):
+    """The model itself."""
+    def __init__(self, config, num_outcomes=1, num_confounders=2):
+        super().__init__(config)
+
+        self.num_labels = config.num_labels
+        self.vocab_size = config.vocab_size
+        self.num_outcomes = num_outcomes
+        self.num_confounders = num_confounders
+
+        self.bert = LongformerModel(config)
+        # self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.vocab_transform = nn.Linear(config.hidden_size, config.hidden_size)
+        self.vocab_layer_norm = nn.LayerNorm(config.hidden_size, eps=1e-12)
+        self.vocab_projector = nn.Linear(config.hidden_size, config.vocab_size)
+
+        self.dragonheads = DragonHeads(self.num_outcomes, self.config.hidden_size, self.num_confounders)
+
+        self.init_weights()
+
+    def forward(self, W_ids, W_len, W_mask, C, T, Y=None, use_mlm=True):
+        if use_mlm:
+            W_len = W_len.unsqueeze(1) - 2 # -2 because of the +1 below
+            mask_class = torch.cuda.FloatTensor if CUDA else torch.FloatTensor
+            mask = (mask_class(W_len.shape).uniform_() * W_len.float()).long() + 1 # + 1 to avoid CLS
+            target_words = torch.gather(W_ids, 1, mask)
+            mlm_labels = torch.ones(W_ids.shape).long() * -100
+            if CUDA:
+                mlm_labels = mlm_labels.cuda()
+            mlm_labels.scatter_(1, mask, target_words)
+            W_ids.scatter_(1, mask, MASK_IDX)
+
+        outputs = self.bert(W_ids, attention_mask=W_mask)
+        seq_output = outputs[0]
+        pooled_output = seq_output[:, 0]
+        # seq_output, pooled_output = outputs[:2]
+        # pooled_output = self.dropout(pooled_output)
+
+        if use_mlm and self.training:
+            prediction_logits = self.vocab_transform(seq_output)  # (bs, seq_length, dim)
+            prediction_logits = gelu(prediction_logits)  # (bs, seq_length, dim)
+            prediction_logits = self.vocab_layer_norm(prediction_logits)  # (bs, seq_length, dim)
+            prediction_logits = self.vocab_projector(prediction_logits)  # (bs, seq_length, vocab_size)
+
+            mlm_loss = CrossEntropyLoss()(
+                prediction_logits.view(-1, self.vocab_size), mlm_labels.view(-1))
+        else:
+            mlm_loss = 0.0
+
+        # constructing input of language model + confounders
+        # previous version that used a categorical C
+        C = C.to(pooled_output.dtype)
+        T = T.to(pooled_output.dtype)
+
+        if Y is not None:
+            Y = Y.to(pooled_output.dtype)
+
+        inputs = torch.cat((pooled_output, C), 1)
+
+        g, Q0, Q1, g_loss, Q_loss = self.dragonheads(inputs, T, Y)
+
+        return F.sigmoid(g), Q0, Q1, g_loss, Q_loss, mlm_loss
+
+
 class CausalDataset(Dataset):
     def __init__(self, 
                  texts, confounds, treatments, outcomes, tokenizer,
@@ -238,10 +301,12 @@ class CausalModelWrapper:
 
     def __init__(self, 
                  model,
+                 tokenizer,
                  g_weight=1.0, Q_weight=0.1, mlm_weight=1.0,
                  batch_size=32, max_length=128, num_workers=1):
         
         self.model = model
+        self.tokenizer = tokenizer
         
         if CUDA:
             self.model = self.model.cuda()
@@ -365,14 +430,10 @@ class CausalModelWrapper:
         return np.mean(Q0 - Q1)
     
     def build_dataloader(self, 
-                         texts, confounds, treatments=None, outcomes=None,
-                         tokenizer=None, sampler='random'):
+                         texts, confounds, treatments=None, outcomes=None, 
+                         sampler='random'):
 
-        if tokenizer is None:
-            tokenizer = DistilBertTokenizer.from_pretrained(
-                'distilbert-base-uncased', do_lower_case=True)
-
-        dataset = CausalDataset(texts, confounds, treatments, outcomes, tokenizer, max_length=self.max_length)
+        dataset = CausalDataset(texts, confounds, treatments, outcomes, self.tokenizer, max_length=self.max_length)
         sampler = RandomSampler(dataset) if sampler == 'random' else SequentialSampler(dataset)
         dataloader = DataLoader(dataset, sampler=sampler, batch_size=self.batch_size, num_workers=self.num_workers)
 
