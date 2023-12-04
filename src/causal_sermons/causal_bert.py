@@ -418,17 +418,6 @@ class CausalModelWrapper:
 
         return all_ate_estimators(Q0, Q1, g, T, Y)
     
-    def ATE_old(self, C, W, Y=None, platt_scaling=False):
-        Q_probs, _, Ys = self.inference(W, C, outcome=Y)
-        if platt_scaling and Y is not None:
-            Q0 = platt_scale(Ys, Q_probs[:, 0])[:, 0]
-            Q1 = platt_scale(Ys, Q_probs[:, 1])[:, 1]
-        else:
-            Q0 = Q_probs[:, 0]
-            Q1 = Q_probs[:, 1]
-
-        return np.mean(Q0 - Q1)
-    
     def build_dataloader(self, 
                          texts, confounds, treatments=None, outcomes=None, 
                          sampler='random'):
