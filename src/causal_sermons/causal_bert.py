@@ -363,55 +363,6 @@ class CausalModelWrapper:
             Q1 = Q_probs[:, 1]
 
         return np.mean(Q0 - Q1)
-
-    def build_dataloader_old(self, 
-                         texts, confounds, treatments=None, outcomes=None,
-                         tokenizer=None, sampler='random'):
-        def collate_CandT(data):
-            # sort by (C, T), so you can get boundaries later
-            # (do this here on cpu for speed)
-            data.sort(key=lambda x: (x[1], x[2]))
-            return data
-        
-        confounds = confounds.values
-        if outcomes is not None:
-            outcomes = outcomes.values
-
-        # fill with dummy values
-        if treatments is None:
-            treatments = np.full((len(confounds), 2), -1)  # like this to fit expected format
-        if outcomes is None:
-            outcomes = np.full(len(treatments), -1)
-
-        if tokenizer is None:
-            tokenizer = DistilBertTokenizer.from_pretrained(
-                'distilbert-base-uncased', do_lower_case=True)
-            
-        out = defaultdict(list)
-        for i, (W, C, T, Y) in enumerate(zip(texts, confounds, treatments, outcomes)):
-            # out['W_raw'].append(W)
-            encoded_sent = tokenizer.encode_plus(
-                W, 
-                add_special_tokens=True,
-                padding='max_length',
-                max_length=self.max_length,
-                truncation=True)
-
-            out['W_ids'].append(encoded_sent['input_ids'])
-            out['W_mask'].append(encoded_sent['attention_mask'])
-            out['W_len'].append(sum(encoded_sent['attention_mask']))
-            out['Y'].append(Y)
-            out['T'].append(T)
-            out['C'].append(C)
-
-        data = (torch.tensor(out[x]) for x in ['W_ids', 'W_len', 'W_mask', 'C', 'T', 'Y'])
-
-        data = TensorDataset(*data)
-        sampler = RandomSampler(data) if sampler == 'random' else SequentialSampler(data)
-        dataloader = DataLoader(data, sampler=sampler, batch_size=self.batch_size)
-            # collate_fn=collate_CandT)
-
-        return dataloader
     
     def build_dataloader(self, 
                          texts, confounds, treatments=None, outcomes=None,
