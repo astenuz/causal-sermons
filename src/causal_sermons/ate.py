@@ -1,4 +1,3 @@
-import numpy as np
 
 
 def tau_naive(t, y):
