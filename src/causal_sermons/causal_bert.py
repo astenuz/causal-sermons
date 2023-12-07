@@ -412,9 +412,12 @@ class CausalModelWrapper:
             torch.cat(Ys, dim=0).numpy()
         )
 
-    def ATE(self, texts, confounds, treatments, outcomes=None):
+    def ATE(self, texts, confounds, treatments, outcomes=None, alpha_c=0.01):
         g, Q0, Q1, T, Y = self.inference(
             texts=texts, confounds=confounds, treatments=treatments, outcomes=outcomes)
+        
+        # dirty fix for extreme propensities
+        g = np.clip(g, alpha_c, 1-alpha_c)
 
         return all_ate_estimators(Q0, Q1, g, T, Y)
     
