@@ -45,6 +45,14 @@ def all_ate_estimators(q_t0, q_t1, g, t, y):
         'tau_DR': tau_DR(q_t0, q_t1, g, t, y),
     }
 
+def all_ite_estimators(q_t0, q_t1, g, t, y):
+    return {
+        'tau_PI': tau_PI_i(q_t0, q_t1),
+        'tau_IPW': tau_IPW_i(g, t, y),
+        'tau_DR': tau_DR_i(q_t0, q_t1, g, t, y),
+    }
+
+
 def get_errors(ate_estimators, gt):
   return {
       'error_naive': ate_estimators['tau_naive'] - gt,
